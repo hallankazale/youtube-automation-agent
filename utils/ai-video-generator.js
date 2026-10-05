@@ -7,6 +7,8 @@ const sharp = require('sharp');
 const { Logger } = require('./logger');
 const { runFFmpeg, getMediaDuration, checkFFmpeg, ffmpegInstallHint } = require('./ffmpeg');
 const { MediaGenerationService } = require('./media-generation-service');
+const { resolveRenderProfile } = require('../platforms/render-profile');
+const { timelineScaleFilter } = require('../platforms/render-commands');
 
 class AIVideoGenerator {
   constructor(credentials, options = {}) {
@@ -341,7 +343,8 @@ class AIVideoGenerator {
             visualAssets,
             audioPath,
             outputPath,
-            options.estimatedDuration || this.calculateScriptDuration(script)
+            options.estimatedDuration || this.calculateScriptDuration(script),
+            options.renderProfile || resolveRenderProfile(options.platform)
           );
           this.lastVideoResult = {
             requestedProvider: generated.requestedProvider,
@@ -359,7 +362,7 @@ class AIVideoGenerator {
         }
       }
 
-      const produced = await this.generateSlideshowVideo(script, visualAssets, audioPath, outputPath);
+      const produced = await this.generateSlideshowVideo(script, visualAssets, audioPath, outputPath, options.renderProfile || resolveRenderProfile(options.platform));
       this.lastVideoResult = { requestedProvider: 'slideshow', actualProvider: 'slideshow', model: 'local-ffmpeg', mode: 'slideshow', generatedSeconds: 0, tasks: [], scenes: [] };
       return produced;
     } catch (error) {
@@ -369,7 +372,7 @@ class AIVideoGenerator {
       const reason = error && error.message ? error.message : String(error);
       this.logger.error(`Video provider generation failed; using the local slideshow: ${reason}`, error);
       try {
-        const produced = await this.generateSlideshowVideo(script, visualAssets, audioPath, outputPath);
+        const produced = await this.generateSlideshowVideo(script, visualAssets, audioPath, outputPath, options.renderProfile || resolveRenderProfile(options.platform));
         this.lastVideoResult = {
           requestedProvider: this.lastVideoResult?.requestedProvider || 'configured-provider',
           actualProvider: 'slideshow', model: 'local-ffmpeg', mode: 'fallback', generatedSeconds: 0,
@@ -388,7 +391,7 @@ class AIVideoGenerator {
     }
   }
 
-  async generateHybridVideo(clips, visualAssets, audioPath, outputPath, totalDuration) {
+  async generateHybridVideo(clips, visualAssets, audioPath, outputPath, totalDuration, renderProfile = resolveRenderProfile()) {
     if (!(await checkFFmpeg())) throw new Error(ffmpegInstallHint());
     const validImages = await this.filterLocalImageAssets(visualAssets);
     const segments = clips.map(clip => ({ type: 'video', path: clip.path, duration: clip.duration }));
@@ -401,21 +404,19 @@ class AIVideoGenerator {
     if (!segments.length) throw new Error('No usable provider clips or still images were generated');
 
     const visualPath = outputPath.replace(/\.mp4$/i, '_hybrid_visual.mp4');
-    await this.renderMediaTimeline(segments, visualPath);
+    await this.renderMediaTimeline(segments, visualPath, renderProfile);
     await this.addAudioToVideo(visualPath, audioPath, outputPath, { loopVideo: true });
     await fs.unlink(visualPath).catch(() => {});
     return outputPath;
   }
 
-  async renderMediaTimeline(segments, outputPath) {
+  async renderMediaTimeline(segments, outputPath, renderProfile = resolveRenderProfile()) {
     const args = ['-y'];
     for (const segment of segments) {
       if (segment.type === 'image') args.push('-loop', '1', '-t', Number(segment.duration).toFixed(2), '-framerate', '30', '-i', segment.path);
       else args.push('-stream_loop', '-1', '-i', segment.path);
     }
-    const filters = segments.map((segment, index) =>
-      `[${index}:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,fps=30,format=yuv420p,trim=duration=${Number(segment.duration).toFixed(2)},setpts=PTS-STARTPTS[v${index}]`
-    );
+    const filters = segments.map((segment, index) => timelineScaleFilter(index, segment, renderProfile));
     filters.push(`${segments.map((_, index) => `[v${index}]`).join('')}concat=n=${segments.length}:v=1:a=0[vout]`);
     args.push('-filter_complex', filters.join(';'), '-map', '[vout]', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', outputPath);
     await runFFmpeg(args);
@@ -467,7 +468,7 @@ class AIVideoGenerator {
     return outputPath;
   }
 
-  async generateSlideshowVideo(script, visualAssets, audioPath, outputPath) {
+  async generateSlideshowVideo(script, visualAssets, audioPath, outputPath, renderProfile = resolveRenderProfile()) {
     this.logger.info('Creating slideshow video...');
 
     if (!(await checkFFmpeg())) {
@@ -480,11 +481,11 @@ class AIVideoGenerator {
 
     try {
       const page = await browser.newPage();
-      await page.setViewportSize({ width: 1920, height: 1080 });
+      await page.setViewportSize({ width: renderProfile.width, height: renderProfile.height });
 
       // Create HTML for slideshow (only real image files can be embedded)
       const imageAssets = await this.filterImageAssets(visualAssets);
-      await page.setContent(this.createSlideshowHTML(script, imageAssets));
+      await page.setContent(this.createSlideshowHTML(script, imageAssets, renderProfile));
 
       // Freeze CSS transitions/animations so each still is captured fully rendered
       await page.addStyleTag({ content: '* { transition: none !important; animation: none !important; }' });
@@ -603,7 +604,7 @@ class AIVideoGenerator {
     return images;
   }
 
-  createSlideshowHTML(script, visualAssets) {
+  createSlideshowHTML(script, visualAssets, renderProfile = resolveRenderProfile()) {
     return `
 <!DOCTYPE html>
 <html>
@@ -612,8 +613,8 @@ class AIVideoGenerator {
         body {
             margin: 0;
             padding: 0;
-            width: 1920px;
-            height: 1080px;
+            width: ${renderProfile.width}px;
+            height: ${renderProfile.height}px;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             font-family: 'Arial', sans-serif;
             overflow: hidden;
