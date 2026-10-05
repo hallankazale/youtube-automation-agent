@@ -3,6 +3,7 @@ const fs = require('fs').promises;
 const { Logger } = require('../utils/logger');
 const { AIVideoGenerator } = require('../utils/ai-video-generator');
 const { SceneRepairService } = require('../utils/scene-repair-service');
+const { resolveRenderProfile, assertDurationAllowed } = require('../platforms/render-profile');
 
 class ProductionManagementAgent {
   constructor(db, credentials) {
@@ -50,7 +51,9 @@ class ProductionManagementAgent {
     try {
       this.logger.info('Processing content for production...');
       
-      const { strategy, script, thumbnail, seo, jobId = null } = contentData;
+      const { strategy, script, thumbnail, seo, jobId = null, platform = 'youtube' } = contentData;
+      const renderProfile = resolveRenderProfile(platform);
+      assertDurationAllowed(script.duration, renderProfile);
       
       // Create production entry
       const productionId = this.generateProductionId();
@@ -81,6 +84,8 @@ class ProductionManagementAgent {
         scheduledPublishTime: this.calculatePublishTime(strategy),
         priority: this.calculatePriority(strategy),
         estimatedDuration: script.duration,
+        platform,
+        renderProfile,
         createdAt: new Date().toISOString()
       };
       productionData.jobId = jobId;
@@ -314,7 +319,7 @@ class ProductionManagementAgent {
         visualAssets: visualAssets,
         duration: productionData.estimatedDuration,
         format: 'mp4',
-        resolution: '1920x1080',
+        resolution: productionData.renderProfile?.resolution || '1920x1080',
         fps: 30,
         generatedWith: 'AI'
       };
@@ -585,7 +590,9 @@ class ProductionManagementAgent {
         {
           jobId: productionData.jobId,
           productionId: productionData.id,
-          estimatedDuration: productionData.estimatedDuration
+          estimatedDuration: productionData.estimatedDuration,
+          platform: productionData.platform,
+          renderProfile: productionData.renderProfile
         }
       );
 
