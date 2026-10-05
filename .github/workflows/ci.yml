@@ -30,3 +30,6 @@ jobs:
 
       - name: Test
         run: npm test
+
+      - name: Validate vertical MP4 render
+        run: node test/vertical-render-dry-run.js
